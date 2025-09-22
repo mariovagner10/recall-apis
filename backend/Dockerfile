@@ -26,7 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copia todo o código do backend
 COPY backend/ .
 
-# Expõe porta do FastAPI
+# Expõe porta do FastAPI 
 EXPOSE 8000
 
 # Comando default para rodar a aplicação
