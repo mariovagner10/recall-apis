@@ -17,4 +17,6 @@ tenacity==8.2.2
 chardet==5.2.0
 
 python-multipart
+XlsxWriter
+
 
