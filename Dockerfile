@@ -1,4 +1,3 @@
-# Dockerfile na raiz do projeto
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -23,4 +22,4 @@ COPY backend/ .
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
