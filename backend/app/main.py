@@ -13,7 +13,8 @@ from datetime import datetime
 import csv
 import io
 import logging
-app = FastAPI(title="API de Processamento de Precatórios By MARIO B.")
+import re
+app = FastAPI(title="API de Processamento de Precatórios - RECALL")
 
 # Configuração do CORS
 origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -41,15 +42,16 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 @app.post("/upload-csv")
-async def upload_csv(
+async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...)
 ):
     logger.info(f"Iniciando upload do arquivo: {file.filename}")
 
-    if not file.filename.endswith(".csv"):
-        logger.error("Arquivo inválido. Deve ser CSV")
-        raise HTTPException(status_code=400, detail="Arquivo deve ser CSV")
+    # Valida extensão
+    if not (file.filename.endswith(".csv") or file.filename.endswith(".xlsx")):
+        logger.error("Arquivo inválido. Deve ser CSV ou XLSX")
+        raise HTTPException(status_code=400, detail="Arquivo deve ser CSV ou XLSX")
     
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as f:
@@ -59,29 +61,37 @@ async def upload_csv(
     # Agenda exclusão do arquivo após envio
     background_tasks.add_task(delete_file, file_path)
 
-    # Detecta encoding
-    with open(file_path, "rb") as f:
-        rawdata = f.read()
-        result = chardet.detect(rawdata)
-    encoding = result["encoding"] or "utf-8"
-    logger.info(f"Encoding detectado: {encoding}")
+    df = None
+    if file.filename.endswith(".csv"):
+        # Detecta encoding
+        with open(file_path, "rb") as f:
+            rawdata = f.read()
+            result = chardet.detect(rawdata)
+        encoding = result["encoding"] or "utf-8"
+        logger.info(f"Encoding detectado: {encoding}")
 
-    # Lê CSV
-    try:
-        df = pd.read_csv(file_path, dtype=str, encoding=encoding, sep=None, engine='python')
-        logger.info(f"CSV lido com sucesso. Total de linhas: {len(df)}")
-    except Exception as e:
-        logger.error(f"Erro ao ler CSV: {e}")
-        raise HTTPException(status_code=500, detail=f"Erro ao ler CSV: {e}")
+        try:
+            df = pd.read_csv(file_path, dtype=str, encoding=encoding, sep=None, engine='python')
+            logger.info(f"CSV lido com sucesso. Total de linhas: {len(df)}")
+        except Exception as e:
+            logger.error(f"Erro ao ler CSV: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro ao ler CSV: {e}")
     
-    if "numero" not in df.columns:
-        logger.error("Coluna 'numero' não encontrada no CSV")
-        raise HTTPException(status_code=400, detail="CSV deve conter a coluna 'numero'")
-     # Remove espaços em branco antes e depois de cada CNJ
-    df['numero'] = df['numero'].str.strip()
-    logger.info("Espaços em branco nos CNJs removidos")
+    elif file.filename.endswith(".xlsx"):
+        try:
+            df = pd.read_excel(file_path, dtype=str)
+            logger.info(f"XLSX lido com sucesso. Total de linhas: {len(df)}")
+        except Exception as e:
+            logger.error(f"Erro ao ler XLSX: {e}")
+            raise HTTPException(status_code=500, detail=f"Erro ao ler XLSX: {e}")
 
-    # --- Remove duplicatas exatas dentro do CSV ---
+    # Verifica coluna
+    if "numero" not in df.columns:
+        logger.error("Coluna 'numero' não encontrada no arquivo")
+        raise HTTPException(status_code=400, detail="O arquivo deve conter a coluna 'numero'")
+
+    # Remove espaços e duplicatas
+    df['numero'] = df['numero'].str.strip()
     df = df.drop_duplicates(subset=['numero'], keep='first')
     logger.info(f"Duplicatas internas removidas. Total de linhas únicas: {len(df)}")
 
@@ -122,6 +132,7 @@ async def upload_csv(
     logger.info(aviso_final)
     
     return {"detail": aviso_final}
+
 
 # --- Download CSV geral ---
 @app.post("/download-csv/{tribunal_sigla}")
@@ -344,6 +355,275 @@ async def remover_duplicatas(
     background_tasks.add_task(delete_file, file_path)
 
     return FileResponse(file_path, media_type=media_type, filename=novo_filename)
+
+
+# ---------------------------wesley-------------------------------
+def _only_digits(value):
+    """
+    Remove todos os caracteres que não sejam dígitos de uma string.
+    """
+    if isinstance(value, str):
+        return re.sub(r'\D', '', value)
+    return value
+
+
+
+@app.post("/download-requerentes-advogados-xlsx/{tribunal_sigla}", tags=["Relatórios"])
+async def download_requerentes_advogados_xlsx(tribunal_sigla: str):
+    """
+    Gera e retorna um arquivo Excel com duas abas:
+      1) Requerentes: (processo_numero_cnj, envolvido_nome, envolvido_cpf) deduplicado por CPF
+      2) Advogados:   (advogado_nome, advogado_cpf) deduplicado por CPF
+
+    Filtra somente envolvidos com tipo_normalizado = 'Requerente'.
+    """
+    # IMPORTANTE: substitui as opções de joinedload abaixo para os teus modelos reais
+    df_list = []
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Processo)
+            .options(
+                joinedload(Processo.fontes)
+                .joinedload(Fonte.capa)
+                .joinedload(Capa.valor_causa),
+                joinedload(Processo.fontes)
+                .joinedload(Fonte.envolvidos)
+                .joinedload(Envolvido.advogados)
+                .joinedload(Advogado.oabs),
+                joinedload(Processo.processos_relacionados),
+            )
+            .where(getattr(Processo, "unidade_origem_tribunal_sigla") == tribunal_sigla)
+        )
+        processos = result.scalars().unique().all()
+
+    if not processos:
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum processo encontrado para o tribunal fornecido.",
+        )
+
+    # Monta linhas completas (similar ao teu endpoint original)
+    for p in processos:
+        base_data = {
+            "processo_numero_cnj": getattr(p, "numero_cnj", None),
+            "processo_titulo_polo_ativo": getattr(p, "titulo_polo_ativo", None),
+            "processo_titulo_polo_passivo": getattr(p, "titulo_polo_passivo", None),
+            "processo_ano_inicio": getattr(p, "ano_inicio", None),
+            "processo_data_inicio": (
+                p.data_inicio.isoformat() if getattr(p, "data_inicio", None) else None
+            ),
+            "processo_estado_origem": getattr(p, "estado_origem", None),
+            "processo_unidade_origem_nome": getattr(p, "unidade_origem_nome", None),
+            "processo_unidade_origem_cidade": getattr(p, "unidade_origem_cidade", None),
+            "processo_unidade_origem_estado": getattr(p, "unidade_origem_estado", None),
+            "processo_unidade_origem_tribunal_sigla": getattr(
+                p, "unidade_origem_tribunal_sigla", None
+            ),
+            "processo_data_ultima_movimentacao": (
+                p.data_ultima_movimentacao.isoformat()
+                if getattr(p, "data_ultima_movimentacao", None)
+                else None
+            ),
+            "processo_quantidade_movimentacoes": getattr(
+                p, "quantidade_movimentacoes", None
+            ),
+            "processo_fontes_tribunais_estao_arquivadas": getattr(
+                p, "fontes_tribunais_estao_arquivadas", None
+            ),
+            "processo_data_ultima_verificacao": (
+                p.data_ultima_verificacao.isoformat()
+                if getattr(p, "data_ultima_verificacao", None)
+                else None
+            ),
+            "processo_tempo_desde_ultima_verificacao": getattr(
+                p, "tempo_desde_ultima_verificacao", None
+            ),
+            "processo_relacionado_numero": ", ".join(
+                [
+                    getattr(pr, "numero", "")
+                    for pr in getattr(p, "processos_relacionados", [])
+                ]
+            ),
+        }
+
+        for fonte in getattr(p, "fontes", []) or []:
+            capa = getattr(fonte, "capa", None)
+            valor_causa = getattr(capa, "valor_causa", None) if capa else None
+
+            for envolvido in getattr(fonte, "envolvidos", []) or []:
+                if getattr(envolvido, "tipo_normalizado", None) != "Requerente":
+                    continue
+
+                advs = getattr(envolvido, "advogados", []) or []
+
+                # Sem advogados
+                if not advs:
+                    row = base_data.copy()
+                    row.update(
+                        {
+                            "envolvido_nome": getattr(envolvido, "nome", None),
+                            "envolvido_tipo_normalizado": getattr(
+                                envolvido, "tipo_normalizado", None
+                            ),
+                            "envolvido_polo": getattr(envolvido, "polo", None),
+                            "envolvido_cpf": getattr(envolvido, "cpf", None),
+                            "envolvido_cnpj": getattr(envolvido, "cnpj", None),
+                            "envolvido_tipo_pessoa": getattr(
+                                envolvido, "tipo_pessoa", None
+                            ),
+                            "advogado_nome": None,
+                            "advogado_tipo": None,
+                            "advogado_oab": None,
+                            "advogado_cpf": None,
+                            "advogado_cnpj": None,
+                            "advogado_tipo_pessoa": None,
+                        }
+                    )
+                    df_list.append(row)
+                    continue
+
+                # Com advogados
+                for advogado in advs:
+                    oabs = getattr(advogado, "oabs", []) or []
+                    if not oabs:
+                        row = base_data.copy()
+                        row.update(
+                            {
+                                "envolvido_nome": getattr(envolvido, "nome", None),
+                                "envolvido_tipo_normalizado": getattr(
+                                    envolvido, "tipo_normalizado", None
+                                ),
+                                "envolvido_polo": getattr(envolvido, "polo", None),
+                                "envolvido_cpf": getattr(envolvido, "cpf", None),
+                                "envolvido_cnpj": getattr(envolvido, "cnpj", None),
+                                "envolvido_tipo_pessoa": getattr(
+                                    envolvido, "tipo_pessoa", None
+                                ),
+                                "advogado_nome": getattr(advogado, "nome", None),
+                                "advogado_tipo": getattr(
+                                    advogado, "tipo_normalizado", None
+                                ),
+                                "advogado_oab": None,
+                                "advogado_cpf": getattr(advogado, "cpf", None),
+                                "advogado_cnpj": getattr(advogado, "cnpj", None),
+                                "advogado_tipo_pessoa": getattr(
+                                    advogado, "tipo_pessoa", None
+                                ),
+                            }
+                        )
+                        df_list.append(row)
+                        continue
+
+                    for oab in oabs:
+                        numero = getattr(oab, "numero", None)
+                        uf = getattr(oab, "uf", None)
+                        row = base_data.copy()
+                        row.update(
+                            {
+                                "envolvido_nome": getattr(envolvido, "nome", None),
+                                "envolvido_tipo_normalizado": getattr(
+                                    envolvido, "tipo_normalizado", None
+                                ),
+                                "envolvido_polo": getattr(envolvido, "polo", None),
+                                "envolvido_cpf": getattr(envolvido, "cpf", None),
+                                "envolvido_cnpj": getattr(envolvido, "cnpj", None),
+                                "envolvido_tipo_pessoa": getattr(
+                                    envolvido, "tipo_pessoa", None
+                                ),
+                                "advogado_nome": getattr(advogado, "nome", None),
+                                "advogado_tipo": getattr(
+                                    advogado, "tipo_normalizado", None
+                                ),
+                                "advogado_oab": (
+                                    f"{numero}/{uf}" if numero and uf else None
+                                ),
+                                "advogado_cpf": getattr(advogado, "cpf", None),
+                                "advogado_cnpj": getattr(advogado, "cnpj", None),
+                                "advogado_tipo_pessoa": getattr(
+                                    advogado, "tipo_pessoa", None
+                                ),
+                            }
+                        )
+                        df_list.append(row)
+
+    if not df_list:
+        raise HTTPException(
+            status_code=404,
+            detail="Nenhum Requerente encontrado para o tribunal fornecido.",
+        )
+
+    df_export = pd.DataFrame(df_list)
+
+    # ====== Separar + deduplicar ======
+    # Requerentes
+    df_requerentes = df_export[
+        ["processo_numero_cnj", "envolvido_nome", "envolvido_cpf"]
+    ].copy()
+    df_requerentes["envolvido_cpf_original"] = (
+        df_requerentes["envolvido_cpf"].astype(str).str.strip()
+    )
+    df_requerentes["envolvido_cpf_clean"] = df_requerentes[
+        "envolvido_cpf_original"
+    ].apply(_only_digits)
+    df_requerentes = df_requerentes.dropna(subset=["envolvido_cpf_clean"])
+    df_requerentes = df_requerentes.drop_duplicates(subset=["envolvido_cpf_clean"])
+    df_requerentes = df_requerentes[
+        ["processo_numero_cnj", "envolvido_nome", "envolvido_cpf_original"]
+    ]
+    df_requerentes = df_requerentes.rename(
+        columns={"envolvido_cpf_original": "envolvido_cpf"}
+    )
+
+    # Advogados
+    df_advogados = df_export[["advogado_nome", "advogado_cpf"]].copy()
+    df_advogados["advogado_cpf_original"] = (
+        df_advogados["advogado_cpf"].astype(str).str.strip()
+    )
+    df_advogados["advogado_cpf_clean"] = df_advogados["advogado_cpf_original"].apply(
+        _only_digits
+    )
+    df_advogados = df_advogados.dropna(subset=["advogado_cpf_clean"])
+    df_advogados = df_advogados.drop_duplicates(subset=["advogado_cpf_clean"])
+    df_advogados = df_advogados[["advogado_nome", "advogado_cpf_original"]]
+    df_advogados = df_advogados.rename(
+        columns={"advogado_cpf_original": "advogado_cpf"}
+    )
+
+    # ====== Escreve Excel (2 abas) ======
+    file_name = (
+        f"requerentes_advogados_{tribunal_sigla}{datetime.now():%Y%m%d%H%M%S}.xlsx"
+    )
+    file_path = os.path.join(UPLOAD_DIR, file_name)
+
+    with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
+        df_requerentes.to_excel(writer, index=False, sheet_name="Requerentes")
+        df_advogados.to_excel(writer, index=False, sheet_name="Advogados")
+
+        wb = writer.book
+        fmt_text = wb.add_format({"num_format": "@", "text_wrap": False})
+
+        # Requerentes: 0=CNJ, 1=nome, 2=cpf
+        ws_req = writer.sheets["Requerentes"]
+        ws_req.set_column(0, 0, 28)  # CNJ
+        ws_req.set_column(1, 1, 36)  # Nome
+        ws_req.set_column(2, 2, 18, fmt_text)  # CPF texto
+        ws_req.autofilter(0, 0, max(len(df_requerentes), 1), 2)
+        ws_req.freeze_panes(1, 0)
+
+        # Advogados: 0=nome, 1=cpf
+        ws_adv = writer.sheets["Advogados"]
+        ws_adv.set_column(0, 0, 36)
+        ws_adv.set_column(1, 1, 18, fmt_text)  # CPF texto
+        ws_adv.autofilter(0, 0, max(len(df_advogados), 1), 1)
+        ws_adv.freeze_panes(1, 0)
+
+    return FileResponse(
+        file_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=file_name,
+    )
+
 
 
 # --- Novo Endpoint para baixar apenas Requerentes ---
