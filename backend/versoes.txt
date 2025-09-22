@@ -1,0 +1,232 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+import pandas as pd
+import time
+import random
+import os
+import re
+import chardet
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service as ChromeService
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import NoSuchElementException, WebDriverException, ElementClickInterceptedException
+
+app = FastAPI(title="API de Busca de Precatórios")
+
+# --- CORS ---
+origins = [
+    "http://localhost:3000",  # frontend React/Vite
+    "http://127.0.0.1:3000"
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# ----------------------
+
+# --- CONFIGURAÇÃO ---
+PAGES_PER_QUERY = 2
+MIN_SLEEP = 5
+MAX_SLEEP = 12
+USE_HEADLESS = False
+SAVE_EVERY = 10
+OUTPUT_FILE = "resultados_precatorios_selenium.xlsx"
+# ----------------------
+
+def human_sleep(a=MIN_SLEEP, b=MAX_SLEEP):
+    """Introduz um tempo de espera aleatório para simular comportamento humano."""
+    time.sleep(random.uniform(a, b))
+
+def setup_driver(headless=USE_HEADLESS):
+    """Configura e retorna uma instância do WebDriver do Chrome."""
+    from selenium.webdriver.chrome.options import Options
+    opts = Options()
+    if headless:
+        opts.add_argument("--headless=new")
+        opts.add_argument("--disable-gpu")
+    opts.add_argument("--start-maximized")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option('useAutomationExtension', False)
+
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()), options=opts)
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    })
+    return driver
+
+def extract_results_from_page(driver, query):
+    """Extrai os resultados de uma página de busca do Google e trata o campo 'title'."""
+    results = []
+    cards = driver.find_elements(By.CSS_SELECTOR, "div.tF2Cxc")
+    for c in cards:
+        try:
+            title_raw = c.find_element(By.CSS_SELECTOR, "h3").text
+        except:
+            title_raw = ""
+        try:
+            link = c.find_element(By.CSS_SELECTOR, "a").get_attribute("href")
+        except:
+            link = ""
+        try:
+            snippet = c.find_element(By.CSS_SELECTOR, ".VwiC3b").text
+        except:
+            try:
+                snippet = c.find_element(By.CSS_SELECTOR, ".aCOpRe").text
+            except:
+                snippet = ""
+        try:
+            site = c.find_element(By.CSS_SELECTOR, ".yuRUbf > a > cite").text
+        except:
+            try:
+                site = c.find_element(By.CSS_SELECTOR, ".TbwUpd").text
+            except:
+                site = ""
+
+        # --- Lógica de extração e tratamento de nome aprimorada ---
+        combined_text = title_raw + " " + snippet
+        nome_encontrado = None  # Inicializa como None para verificar se algo foi encontrado
+
+        # Tenta extrair nome diretamente do snippet (ex: "Requerente. Nome Sobrenome")
+        match_requerente = re.search(r'(?:Requerente|Advogado)\. (.+?)(?: -|$)', combined_text, re.IGNORECASE)
+        if match_requerente:
+            nome_encontrado = match_requerente.group(1).strip()
+        else:
+            # Regex mais genérica para nomes próprios (ex: "Daisson Silva Portanova")
+            regex_nome_generico = r'\b[A-Z][a-z]+(?: [A-Z][a-z]+)+'
+            match_nome_generico = re.search(regex_nome_generico, combined_text)
+            if match_nome_generico:
+                nome_encontrado = match_nome_generico.group(0)
+
+        # Define o título: se encontrou nome, usa o nome. Senão, usa o aviso.
+        title_to_save = nome_encontrado if nome_encontrado else "sem nome atrelado na busca"
+        # ----------------------------------
+
+        results.append({
+            "query": query,
+            "title": title_to_save,
+            "snippet": snippet,
+            "link": link,
+            "site": site
+        })
+    return results
+
+def go_next_page(driver):
+    """Tenta navegar para a próxima página de resultados."""
+    try:
+        nxt = driver.find_element(By.ID, "pnnext")
+        driver.execute_script("arguments[0].scrollIntoView(true);", nxt)
+        human_sleep(0.8, 1.6)
+        nxt.click()
+        return True
+    except (NoSuchElementException, ElementClickInterceptedException):
+        return False
+
+def run_search(queries):
+    """Executa a busca no Google para cada query fornecida e salva os resultados."""
+    driver = setup_driver()
+    results_all = []
+    processed = 0
+    try:
+        for q in queries:
+            print(f"[{processed+1}/{len(queries)}] Buscando: {q}")
+            driver.get("https://www.google.com/")
+            human_sleep(1.2, 2.5)
+            try:
+                box = driver.find_element(By.NAME, "q")
+                box.clear()
+                box.send_keys(f'"{q}"')
+                human_sleep(0.5, 1.2)
+                box.send_keys(Keys.RETURN)
+            except WebDriverException:
+                human_sleep(5, 8)  # Espera mais longa se houver erro de WebDriver
+                continue
+
+            human_sleep(2.0, 4.0)
+            driver.execute_script("window.scrollBy(0, 300);")
+            human_sleep(0.6, 1.4)
+
+            page = 0
+            while page < PAGES_PER_QUERY:
+                page += 1
+                human_sleep(1.0, 2.5)
+                results_page = extract_results_from_page(driver, q)
+                if results_page:
+                    results_all.extend(results_page)
+                    print(f"  -> extraídos {len(results_page)} resultados (página {page})")
+                if page < PAGES_PER_QUERY:
+                    if not go_next_page(driver):
+                        break
+                    human_sleep(2.5, 5.0)
+
+            processed += 1
+            human_sleep(MIN_SLEEP, MAX_SLEEP)
+
+            if processed % SAVE_EVERY == 0:
+                pd.DataFrame(results_all).to_excel(OUTPUT_FILE, index=False)
+                print(f"  -> salvo parcial ({processed} queries processadas).")
+    finally:
+        # Salva os resultados finais, mesmo que tenha ocorrido um erro
+        pd.DataFrame(results_all).to_excel(OUTPUT_FILE, index=False)
+        driver.quit()  # Garante que o driver seja fechado
+    return OUTPUT_FILE
+
+@app.post("/upload-csv/")
+async def upload_csv(file: UploadFile = File(...)):
+    """Recebe um arquivo CSV, extrai os números de processo e inicia o scraping."""
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Apenas arquivos CSV são permitidos.")
+
+    import io
+
+    raw_data = await file.read()
+    file.file.seek(0)  # Retorna ao início do arquivo para leitura
+
+    # Detecta o encoding do arquivo para evitar erros de leitura
+    encoding_info = chardet.detect(raw_data)
+    encoding = encoding_info.get("encoding", "utf-8")  # Usa utf-8 como fallback
+
+    try:
+        text_data = raw_data.decode(encoding)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao decodificar CSV: {str(e)}")
+
+    csv_buffer = io.StringIO(text_data)
+
+    # Tenta ler o CSV, detectando o separador automaticamente
+    try:
+        df = pd.read_csv(csv_buffer, sep=None, engine='python', skip_blank_lines=True)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erro ao ler CSV. Verifique o formato do arquivo: {str(e)}")
+
+    # Normaliza os nomes das colunas para minúsculas e remove espaços extras
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Procura por uma coluna que contenha 'numero' (considerando variações)
+    numero_col = next((c for c in df.columns if "numero" in c or "processo" in c), None)
+    if not numero_col:
+        raise HTTPException(
+            status_code=400,
+            detail=f"O arquivo CSV deve conter uma coluna com o número do processo (ex: 'numero', 'processo'). Colunas encontradas: {df.columns.tolist()}"
+        )
+
+    # Extrai as queries (números de processo) da coluna identificada
+    queries = df[numero_col].astype(str).tolist()
+
+    try:
+        output_path = run_search(queries)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ocorreu um erro durante a execução da busca: {str(e)}")
+
+    # Retorna o arquivo Excel com os resultados
+    return FileResponse(
+        output_path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=os.path.basename(output_path)
+    )

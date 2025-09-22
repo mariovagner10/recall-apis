@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+sqlalchemy[asyncio]
+asyncpg
+aiohttp
+async_timeout
+pandas
+python-dotenv
+tenacity
