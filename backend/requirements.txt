@@ -18,5 +18,5 @@ chardet==5.2.0
 
 python-multipart
 XlsxWriter
-
+openpyxl
 

@@ -79,12 +79,14 @@ async def upload_file(
     
     elif file.filename.endswith(".xlsx"):
         try:
-            df = pd.read_excel(file_path, dtype=str)
+            df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+
             logger.info(f"XLSX lido com sucesso. Total de linhas: {len(df)}")
         except Exception as e:
             logger.error(f"Erro ao ler XLSX: {e}")
             raise HTTPException(status_code=500, detail=f"Erro ao ler XLSX: {e}")
 
+    df.columns = df.columns.str.strip().str.lower()
     # Verifica coluna
     if "numero" not in df.columns:
         logger.error("Coluna 'numero' não encontrada no arquivo")
