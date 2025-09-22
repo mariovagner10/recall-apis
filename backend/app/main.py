@@ -41,11 +41,18 @@ def delete_file(path: str):
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def formatar_cnj(numero: str) -> str:
+    """
+    Recebe um número de CNJ sem formatação e retorna no formato padrão:
+    0000000-00.0000.0.00.0000
+    """
+    if not numero or not numero.isdigit() or len(numero) != 20:
+        return numero  # Retorna como está se não tiver 20 dígitos
+    return f"{numero[:7]}-{numero[7:9]}.{numero[9:13]}.{numero[13]}.{numero[14:16]}.{numero[16:]}"
+
 @app.post("/upload-csv")
-async def upload_file(
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
-):
+async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     logger.info(f"Iniciando upload do arquivo: {file.filename}")
 
     # Valida extensão
@@ -63,7 +70,6 @@ async def upload_file(
 
     df = None
     if file.filename.endswith(".csv"):
-        # Detecta encoding
         with open(file_path, "rb") as f:
             rawdata = f.read()
             result = chardet.detect(rawdata)
@@ -80,27 +86,25 @@ async def upload_file(
     elif file.filename.endswith(".xlsx"):
         try:
             df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
-
             logger.info(f"XLSX lido com sucesso. Total de linhas: {len(df)}")
         except Exception as e:
             logger.error(f"Erro ao ler XLSX: {e}")
             raise HTTPException(status_code=500, detail=f"Erro ao ler XLSX: {e}")
 
     df.columns = df.columns.str.strip().str.lower()
-    # Verifica coluna
     if "numero" not in df.columns:
         logger.error("Coluna 'numero' não encontrada no arquivo")
         raise HTTPException(status_code=400, detail="O arquivo deve conter a coluna 'numero'")
 
-    # Remove espaços e duplicatas
-    df['numero'] = df['numero'].str.strip()
+    # Remove espaços, aplica formatação e remove duplicatas
+    df['numero'] = df['numero'].str.strip().apply(formatar_cnj)
     df = df.drop_duplicates(subset=['numero'], keep='first')
     logger.info(f"Duplicatas internas removidas. Total de linhas únicas: {len(df)}")
 
     numeros_cnj_csv = df["numero"].dropna().tolist()
     logger.info(f"Total de CNJs após remover duplicatas internas: {len(numeros_cnj_csv)}")
 
-    # Verifica CNJs já existentes no banco
+    # Consulta CNJs existentes no banco
     async with AsyncSessionLocal() as session:
         existing_processos = await session.execute(
             select(Processo.numero_cnj).where(Processo.numero_cnj.in_(numeros_cnj_csv))
