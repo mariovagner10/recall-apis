@@ -1,3 +1,4 @@
+# Dockerfile na raiz do projeto
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -13,13 +14,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copia e instala dependências Python
+# Copia requirements.txt
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Instala NumPy primeiro para evitar conflitos com Pandas
+RUN pip install --no-cache-dir numpy==1.27.6 \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copia todo o código do backend
 COPY backend/ .
 
 EXPOSE 8000
 
+# Comando padrão para rodar FastAPI
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
