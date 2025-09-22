@@ -1,10 +1,17 @@
-fastapi==0.111.2
+# FastAPI e servidor ASGI
+fastapi==0.117.1
 uvicorn[standard]==0.23.2
-sqlalchemy[asyncio]==2.1.1
-asyncpg==1.27.0
-aiohttp==3.9.4
+
+# Banco de dados e ORM assíncrono
+SQLAlchemy[asyncio]==2.0.25
+asyncpg==0.27.0
+
+# Requisições assíncronas
+aiohttp==3.9.5
 async-timeout==4.0.3
+
+# Utilitários
 pandas==2.1.1
-python-dotenv==1.1.1
-tenacity==9.3.5
+python-dotenv==1.0.0
+tenacity==8.2.2
 chardet==5.2.0

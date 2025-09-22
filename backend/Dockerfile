@@ -1,18 +1,33 @@
-# Imagem base
+# Dockerfile para backend Python FastAPI
 FROM python:3.11-slim
 
-# Diretório de trabalho
+# Evita prompts durante instalação
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Configura o diretório de trabalho
 WORKDIR /app
 
-# Copiar dependências e instalar
-COPY requirements.txt .
+# Atualiza pip e instala dependências do sistema
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    gcc \
+    libpq-dev \
+    curl \
+    && python -m pip install --upgrade pip \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copia requirements.txt
+COPY backend/requirements.txt .
+
+# Instala dependências Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar todo o código
-COPY . .
+# Copia todo o código do backend
+COPY backend/ .
 
-# Expõe a porta que o FastAPI vai rodar
+# Expõe porta do FastAPI
 EXPOSE 8000
 
-# Comando padrão para rodar o backend
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+# Comando default para rodar a aplicação
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
