@@ -1,0 +1,26 @@
+# Arquivos do Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Ambiente virtual
+venv/
+env/
+.venv/
+
+# Arquivos de configuração
+.env
+.env.* 
+
+# Logs e arquivos temporários
+*.log
+*.sqlite3
+*.db
+*.bak
+*.swp
+.DS_Store
+
+# Pasta de uploads temporários
+uploads/
