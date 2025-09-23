@@ -1,6 +1,7 @@
 import pandas as pd
 import asyncio
 import aiohttp
+import traceback
 from datetime import datetime, date
 from app.database import AsyncSessionLocal
 from app.models import (
@@ -266,19 +267,27 @@ async def processar_lote(numeros_cnj: list):
         print(f"Processando batch {i//BATCH_SIZE + 1} ({len(batch)} CNJs)")
 
         async with aiohttp.ClientSession() as session:
-            tasks = [consultar_numero(session, numero) for numero in batch]
-            resultados = await asyncio.gather(*tasks, return_exceptions=True)
+            # manter referência do número + tarefa
+            tasks = [(numero, consultar_numero(session, numero)) for numero in batch]
+            resultados = await asyncio.gather(
+                *[t for _, t in tasks], return_exceptions=True
+            )
 
         async with AsyncSessionLocal() as db_session:
-            for r in resultados:
+            for (numero, _), r in zip(tasks, resultados):
                 if isinstance(r, Exception):
-                    print(f"Erro ao consultar CNJ: {r}")
+                    causa = getattr(r, "__cause__", None)
+                    print(f"❌ Erro ao consultar CNJ {numero}: {repr(r)}")
+                    if causa:
+                        print(f"   ↳ Causa raiz: {repr(causa)}")
+                        print("   Traceback:")
+                        traceback.print_exception(type(causa), causa, causa.__traceback__)
                 elif r:
                     try:
                         await salvar_processo(db_session, r)
                     except Exception as e:
                         await db_session.rollback()
-                        print(f"Erro ao salvar CNJ {r.get('numero_cnj')}: {e}")
+                        print(f"💾 Erro ao salvar CNJ {r.get('numero_cnj')}: {e}")
             
 async def processar_csv(file_path: str):
     """Lê CSV e processa os CNJs chamando processar_lote."""

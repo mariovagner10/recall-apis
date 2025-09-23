@@ -373,255 +373,216 @@ def _only_digits(value):
     return value
 
 
-
 @app.post("/download-requerentes-advogados-xlsx/{tribunal_sigla}", tags=["Relatórios"])
 async def download_requerentes_advogados_xlsx(tribunal_sigla: str):
     """
-    Gera e retorna um arquivo Excel com duas abas:
-      1) Requerentes: (processo_numero_cnj, envolvido_nome, envolvido_cpf) deduplicado por CPF
-      2) Advogados:   (advogado_nome, advogado_cpf) deduplicado por CPF
+    Gera e retorna um XLSX com duas abas:
 
-    Filtra somente envolvidos com tipo_normalizado = 'Requerente'.
+    1) Requerentes (autores):
+       processo_numero_cnj, envolvido_nome, envolvido_tipo_normalizado,
+       envolvido_cpf, envolvido_cnpj, envolvido_tipo_pessoa,
+       processo_ano_inicio, processo_data_inicio, processo_estado_origem,
+       processo_unidade_origem_nome, processo_unidade_origem_cidade, processo_unidade_origem_estado,
+       processo_unidade_origem_tribunal_sigla, processo_data_ultima_movimentacao,
+       processo_quantidade_movimentacoes, processo_fontes_tribunais_estao_arquivadas,
+       processo_data_ultima_verificacao, processo_tempo_desde_ultima_verificacao,
+       processo_relacionado_numero, fonte_sigla, fonte_data_inicio, fonte_sistema,
+       fonte_quantidade_envolvidos, capa_classe, capa_assunto, capa_valor_causa
+
+       Dedup: primeiro por CPF (sem excluir nullos); onde CPF estiver vazio,
+              dedup por CNPJ. Mantém linhas sem CPF e CNPJ.
+
+    2) Advogados:
+       advogado_nome, advogado_tipo, advogado_oab, advogado_cpf, advogado_cnpj, advogado_tipo_pessoa
+       + todas as colunas acima (processo/fonte/capa), mas **sem** os campos de envolvido.
+
+       Dedup: primeiro por CPF (sem excluir nullos); onde CPF vazio, por CNPJ.
     """
-    # IMPORTANTE: substitui as opções de joinedload abaixo para os teus modelos reais
     df_list = []
 
     async with AsyncSessionLocal() as session:
         result = await session.execute(
             select(Processo)
             .options(
-                joinedload(Processo.fontes)
-                .joinedload(Fonte.capa)
-                .joinedload(Capa.valor_causa),
-                joinedload(Processo.fontes)
-                .joinedload(Fonte.envolvidos)
-                .joinedload(Envolvido.advogados)
-                .joinedload(Advogado.oabs),
+                joinedload(Processo.fontes).joinedload(Fonte.capa).joinedload(Capa.valor_causa),
+                joinedload(Processo.fontes).joinedload(Fonte.envolvidos).joinedload(Envolvido.advogados).joinedload(Advogado.oabs),
                 joinedload(Processo.processos_relacionados),
             )
-            .where(getattr(Processo, "unidade_origem_tribunal_sigla") == tribunal_sigla)
+            .where(Processo.unidade_origem_tribunal_sigla == tribunal_sigla)
         )
         processos = result.scalars().unique().all()
 
     if not processos:
-        raise HTTPException(
-            status_code=404,
-            detail="Nenhum processo encontrado para o tribunal fornecido.",
-        )
+        raise HTTPException(status_code=404, detail="Nenhum processo encontrado para o tribunal fornecido.")
 
-    # Monta linhas completas (similar ao teu endpoint original)
     for p in processos:
-        base_data = {
-            "processo_numero_cnj": getattr(p, "numero_cnj", None),
-            "processo_titulo_polo_ativo": getattr(p, "titulo_polo_ativo", None),
-            "processo_titulo_polo_passivo": getattr(p, "titulo_polo_passivo", None),
-            "processo_ano_inicio": getattr(p, "ano_inicio", None),
-            "processo_data_inicio": (
-                p.data_inicio.isoformat() if getattr(p, "data_inicio", None) else None
-            ),
-            "processo_estado_origem": getattr(p, "estado_origem", None),
-            "processo_unidade_origem_nome": getattr(p, "unidade_origem_nome", None),
-            "processo_unidade_origem_cidade": getattr(p, "unidade_origem_cidade", None),
-            "processo_unidade_origem_estado": getattr(p, "unidade_origem_estado", None),
-            "processo_unidade_origem_tribunal_sigla": getattr(
-                p, "unidade_origem_tribunal_sigla", None
-            ),
-            "processo_data_ultima_movimentacao": (
-                p.data_ultima_movimentacao.isoformat()
-                if getattr(p, "data_ultima_movimentacao", None)
-                else None
-            ),
-            "processo_quantidade_movimentacoes": getattr(
-                p, "quantidade_movimentacoes", None
-            ),
-            "processo_fontes_tribunais_estao_arquivadas": getattr(
-                p, "fontes_tribunais_estao_arquivadas", None
-            ),
-            "processo_data_ultima_verificacao": (
-                p.data_ultima_verificacao.isoformat()
-                if getattr(p, "data_ultima_verificacao", None)
-                else None
-            ),
-            "processo_tempo_desde_ultima_verificacao": getattr(
-                p, "tempo_desde_ultima_verificacao", None
-            ),
-            "processo_relacionado_numero": ", ".join(
-                [
-                    getattr(pr, "numero", "")
-                    for pr in getattr(p, "processos_relacionados", [])
-                ]
-            ),
+        base = {
+            "processo_numero_cnj": p.numero_cnj,
+            "processo_ano_inicio": p.ano_inicio,
+            "processo_data_inicio": p.data_inicio.isoformat() if p.data_inicio else None,
+            "processo_estado_origem": p.estado_origem,
+            "processo_unidade_origem_nome": p.unidade_origem_nome,
+            "processo_unidade_origem_cidade": p.unidade_origem_cidade,
+            "processo_unidade_origem_estado": p.unidade_origem_estado,
+            "processo_unidade_origem_tribunal_sigla": p.unidade_origem_tribunal_sigla,
+            "processo_data_ultima_movimentacao": p.data_ultima_movimentacao.isoformat() if p.data_ultima_movimentacao else None,
+            "processo_quantidade_movimentacoes": p.quantidade_movimentacoes,
+            "processo_fontes_tribunais_estao_arquivadas": p.fontes_tribunais_estao_arquivadas,
+            "processo_data_ultima_verificacao": p.data_ultima_verificacao.isoformat() if p.data_ultima_verificacao else None,
+            "processo_tempo_desde_ultima_verificacao": p.tempo_desde_ultima_verificacao,
+            "processo_relacionado_numero": ", ".join([pr.numero for pr in p.processos_relacionados]),
         }
 
-        for fonte in getattr(p, "fontes", []) or []:
-            capa = getattr(fonte, "capa", None)
-            valor_causa = getattr(capa, "valor_causa", None) if capa else None
+        for fonte in p.fontes or []:
+            capa = fonte.capa
+            row_common = {
+                **base,
+                "fonte_sigla": fonte.sigla,
+                "fonte_data_inicio": fonte.data_inicio.isoformat() if fonte.data_inicio else None,
+                "fonte_sistema": fonte.sistema,
+                "fonte_quantidade_envolvidos": fonte.quantidade_envolvidos,
+                "capa_classe": capa.classe if capa else None,
+                "capa_assunto": capa.assunto if capa else None,
+                "capa_valor_causa": (capa.valor_causa.valor_formatado if capa and capa.valor_causa else None),
+            }
 
-            for envolvido in getattr(fonte, "envolvidos", []) or []:
-                if getattr(envolvido, "tipo_normalizado", None) != "Requerente":
+            for envolvido in (fonte.envolvidos or []):
+                if envolvido.tipo_normalizado != "Requerente":
                     continue
 
-                advs = getattr(envolvido, "advogados", []) or []
-
-                # Sem advogados
-                if not advs:
-                    row = base_data.copy()
-                    row.update(
-                        {
-                            "envolvido_nome": getattr(envolvido, "nome", None),
-                            "envolvido_tipo_normalizado": getattr(
-                                envolvido, "tipo_normalizado", None
-                            ),
-                            "envolvido_polo": getattr(envolvido, "polo", None),
-                            "envolvido_cpf": getattr(envolvido, "cpf", None),
-                            "envolvido_cnpj": getattr(envolvido, "cnpj", None),
-                            "envolvido_tipo_pessoa": getattr(
-                                envolvido, "tipo_pessoa", None
-                            ),
-                            "advogado_nome": None,
-                            "advogado_tipo": None,
-                            "advogado_oab": None,
-                            "advogado_cpf": None,
-                            "advogado_cnpj": None,
-                            "advogado_tipo_pessoa": None,
-                        }
-                    )
-                    df_list.append(row)
+                # se não houver advogados, ainda assim registramos o requerente
+                if not (envolvido.advogados or []):
+                    df_list.append({
+                        **row_common,
+                        "envolvido_nome": envolvido.nome,
+                        "envolvido_tipo_normalizado": envolvido.tipo_normalizado,
+                        "envolvido_cpf": envolvido.cpf,
+                        "envolvido_cnpj": envolvido.cnpj,
+                        "envolvido_tipo_pessoa": envolvido.tipo_pessoa,
+                        "advogado_nome": None,
+                        "advogado_tipo": None,
+                        "advogado_oab": None,
+                        "advogado_cpf": None,
+                        "advogado_cnpj": None,
+                        "advogado_tipo_pessoa": None,
+                    })
                     continue
 
-                # Com advogados
-                for advogado in advs:
-                    oabs = getattr(advogado, "oabs", []) or []
-                    if not oabs:
-                        row = base_data.copy()
-                        row.update(
-                            {
-                                "envolvido_nome": getattr(envolvido, "nome", None),
-                                "envolvido_tipo_normalizado": getattr(
-                                    envolvido, "tipo_normalizado", None
-                                ),
-                                "envolvido_polo": getattr(envolvido, "polo", None),
-                                "envolvido_cpf": getattr(envolvido, "cpf", None),
-                                "envolvido_cnpj": getattr(envolvido, "cnpj", None),
-                                "envolvido_tipo_pessoa": getattr(
-                                    envolvido, "tipo_pessoa", None
-                                ),
-                                "advogado_nome": getattr(advogado, "nome", None),
-                                "advogado_tipo": getattr(
-                                    advogado, "tipo_normalizado", None
-                                ),
-                                "advogado_oab": None,
-                                "advogado_cpf": getattr(advogado, "cpf", None),
-                                "advogado_cnpj": getattr(advogado, "cnpj", None),
-                                "advogado_tipo_pessoa": getattr(
-                                    advogado, "tipo_pessoa", None
-                                ),
-                            }
-                        )
-                        df_list.append(row)
-                        continue
-
+                for advogado in envolvido.advogados:
+                    # pode ter 0..n OABs; aqui não é chave do dedup, então podemos concatenar ou registrar 1 linha/inscrição
+                    oabs = advogado.oabs or [None]
                     for oab in oabs:
-                        numero = getattr(oab, "numero", None)
-                        uf = getattr(oab, "uf", None)
-                        row = base_data.copy()
-                        row.update(
-                            {
-                                "envolvido_nome": getattr(envolvido, "nome", None),
-                                "envolvido_tipo_normalizado": getattr(
-                                    envolvido, "tipo_normalizado", None
-                                ),
-                                "envolvido_polo": getattr(envolvido, "polo", None),
-                                "envolvido_cpf": getattr(envolvido, "cpf", None),
-                                "envolvido_cnpj": getattr(envolvido, "cnpj", None),
-                                "envolvido_tipo_pessoa": getattr(
-                                    envolvido, "tipo_pessoa", None
-                                ),
-                                "advogado_nome": getattr(advogado, "nome", None),
-                                "advogado_tipo": getattr(
-                                    advogado, "tipo_normalizado", None
-                                ),
-                                "advogado_oab": (
-                                    f"{numero}/{uf}" if numero and uf else None
-                                ),
-                                "advogado_cpf": getattr(advogado, "cpf", None),
-                                "advogado_cnpj": getattr(advogado, "cnpj", None),
-                                "advogado_tipo_pessoa": getattr(
-                                    advogado, "tipo_pessoa", None
-                                ),
-                            }
-                        )
-                        df_list.append(row)
+                        df_list.append({
+                            **row_common,
+                            "envolvido_nome": envolvido.nome,
+                            "envolvido_tipo_normalizado": envolvido.tipo_normalizado,
+                            "envolvido_cpf": envolvido.cpf,
+                            "envolvido_cnpj": envolvido.cnpj,
+                            "envolvido_tipo_pessoa": envolvido.tipo_pessoa,
+                            "advogado_nome": advogado.nome,
+                            "advogado_tipo": advogado.tipo_normalizado,
+                            "advogado_oab": (f"{getattr(oab, 'numero', None)}/{getattr(oab, 'uf', None)}" if oab and getattr(oab, "numero", None) and getattr(oab, "uf", None) else None),
+                            "advogado_cpf": advogado.cpf,
+                            "advogado_cnpj": advogado.cnpj,
+                            "advogado_tipo_pessoa": advogado.tipo_pessoa,
+                        })
 
     if not df_list:
-        raise HTTPException(
-            status_code=404,
-            detail="Nenhum Requerente encontrado para o tribunal fornecido.",
-        )
+        raise HTTPException(status_code=404, detail="Nenhum Requerente encontrado para o tribunal fornecido.")
 
-    df_export = pd.DataFrame(df_list)
+    df = pd.DataFrame(df_list)
 
-    # ====== Separar + deduplicar ======
-    # Requerentes
-    df_requerentes = df_export[
-        ["processo_numero_cnj", "envolvido_nome", "envolvido_cpf"]
-    ].copy()
-    df_requerentes["envolvido_cpf_original"] = (
-        df_requerentes["envolvido_cpf"].astype(str).str.strip()
-    )
-    df_requerentes["envolvido_cpf_clean"] = df_requerentes[
-        "envolvido_cpf_original"
-    ].apply(_only_digits)
-    df_requerentes = df_requerentes.dropna(subset=["envolvido_cpf_clean"])
-    df_requerentes = df_requerentes.drop_duplicates(subset=["envolvido_cpf_clean"])
-    df_requerentes = df_requerentes[
-        ["processo_numero_cnj", "envolvido_nome", "envolvido_cpf_original"]
+    # -------------------------------
+    # ABA REQUERENTES (autores)
+    # -------------------------------
+    req_cols = [
+        "processo_numero_cnj", "envolvido_nome", "envolvido_tipo_normalizado",
+        "envolvido_cpf", "envolvido_cnpj", "envolvido_tipo_pessoa",
+        "processo_ano_inicio", "processo_data_inicio", "processo_estado_origem",
+        "processo_unidade_origem_nome", "processo_unidade_origem_cidade", "processo_unidade_origem_estado",
+        "processo_unidade_origem_tribunal_sigla", "processo_data_ultima_movimentacao",
+        "processo_quantidade_movimentacoes", "processo_fontes_tribunais_estao_arquivadas",
+        "processo_data_ultima_verificacao", "processo_tempo_desde_ultima_verificacao",
+        "processo_relacionado_numero",
+        "fonte_sigla", "fonte_data_inicio", "fonte_sistema", "fonte_quantidade_envolvidos",
+        "capa_classe", "capa_assunto", "capa_valor_causa",
     ]
-    df_requerentes = df_requerentes.rename(
-        columns={"envolvido_cpf_original": "envolvido_cpf"}
-    )
+    req = df.reindex(columns=req_cols)
 
-    # Advogados
-    df_advogados = df_export[["advogado_nome", "advogado_cpf"]].copy()
-    df_advogados["advogado_cpf_original"] = (
-        df_advogados["advogado_cpf"].astype(str).str.strip()
-    )
-    df_advogados["advogado_cpf_clean"] = df_advogados["advogado_cpf_original"].apply(
-        _only_digits
-    )
-    df_advogados = df_advogados.dropna(subset=["advogado_cpf_clean"])
-    df_advogados = df_advogados.drop_duplicates(subset=["advogado_cpf_clean"])
-    df_advogados = df_advogados[["advogado_nome", "advogado_cpf_original"]]
-    df_advogados = df_advogados.rename(
-        columns={"advogado_cpf_original": "advogado_cpf"}
-    )
+    # Dedup: primeiro por CPF (mantendo nulls), depois, nas linhas SEM CPF, por CNPJ
+    req["cpf_clean"] = req["envolvido_cpf"].astype(str).str.replace(r"\D+", "", regex=True)
+    req["cnpj_clean"] = req["envolvido_cnpj"].astype(str).str.replace(r"\D+", "", regex=True)
 
-    # ====== Escreve Excel (2 abas) ======
-    file_name = (
-        f"requerentes_advogados_{tribunal_sigla}{datetime.now():%Y%m%d%H%M%S}.xlsx"
-    )
+    mask_cpf = req["cpf_clean"].str.len() > 0
+    req_cpf = req[mask_cpf].drop_duplicates(subset=["cpf_clean"], keep="first")
+    req_sem_cpf = req[~mask_cpf].drop_duplicates(subset=["cnpj_clean"], keep="first")
+
+    req_final = pd.concat([req_cpf, req_sem_cpf], ignore_index=True)
+    req_final = req_final.drop(columns=["cpf_clean", "cnpj_clean"])
+
+    # -------------------------------
+    # ABA ADVOGADOS
+    # -------------------------------
+    # Mantém todas as colunas de processo/fonte/capa e as cols de advogado,
+    # e remove as cols de envolvido_* (conforme pedido).
+    adv_cols_keep = [
+        # advogado
+        "advogado_nome", "advogado_tipo", "advogado_oab", "advogado_cpf", "advogado_cnpj", "advogado_tipo_pessoa",
+        # processo/fonte/capa (mesmas do req)
+        "processo_numero_cnj",
+        "processo_ano_inicio", "processo_data_inicio", "processo_estado_origem",
+        "processo_unidade_origem_nome", "processo_unidade_origem_cidade", "processo_unidade_origem_estado",
+        "processo_unidade_origem_tribunal_sigla", "processo_data_ultima_movimentacao",
+        "processo_quantidade_movimentacoes", "processo_fontes_tribunais_estao_arquivadas",
+        "processo_data_ultima_verificacao", "processo_tempo_desde_ultima_verificacao",
+        "processo_relacionado_numero",
+        "fonte_sigla", "fonte_data_inicio", "fonte_sistema", "fonte_quantidade_envolvidos",
+        "capa_classe", "capa_assunto", "capa_valor_causa",
+    ]
+    adv = df.reindex(columns=adv_cols_keep)
+
+    # Dedup: primeiro por CPF (mantendo nulls), depois, nas linhas SEM CPF, por CNPJ
+    adv["cpf_clean"] = adv["advogado_cpf"].astype(str).str.replace(r"\D+", "", regex=True)
+    adv["cnpj_clean"] = adv["advogado_cnpj"].astype(str).str.replace(r"\D+", "", regex=True)
+
+    mask_cpf_adv = adv["cpf_clean"].str.len() > 0
+    adv_cpf = adv[mask_cpf_adv].drop_duplicates(subset=["cpf_clean"], keep="first")
+    adv_sem_cpf = adv[~mask_cpf_adv].drop_duplicates(subset=["cnpj_clean"], keep="first")
+
+    adv_final = pd.concat([adv_cpf, adv_sem_cpf], ignore_index=True)
+    adv_final = adv_final.drop(columns=["cpf_clean", "cnpj_clean"])
+
+    # -------------------------------
+    # XLSX com 2 abas
+    # -------------------------------
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    file_name = f"requerentes_advogados_{tribunal_sigla}_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
     file_path = os.path.join(UPLOAD_DIR, file_name)
 
     with pd.ExcelWriter(file_path, engine="xlsxwriter") as writer:
-        df_requerentes.to_excel(writer, index=False, sheet_name="Requerentes")
-        df_advogados.to_excel(writer, index=False, sheet_name="Advogados")
+        req_final.to_excel(writer, index=False, sheet_name="Requerentes")
+        adv_final.to_excel(writer, index=False, sheet_name="Advogados")
 
         wb = writer.book
         fmt_text = wb.add_format({"num_format": "@", "text_wrap": False})
 
-        # Requerentes: 0=CNJ, 1=nome, 2=cpf
+        # Requerentes
         ws_req = writer.sheets["Requerentes"]
-        ws_req.set_column(0, 0, 28)  # CNJ
-        ws_req.set_column(1, 1, 36)  # Nome
-        ws_req.set_column(2, 2, 18, fmt_text)  # CPF texto
-        ws_req.autofilter(0, 0, max(len(df_requerentes), 1), 2)
+        # CPF/CNPJ como texto (colunas pelos índices dinâmicos)
+        col_idx_req = {c:i for i,c in enumerate(req_final.columns)}
+        ws_req.set_column(0, len(req_final.columns)-1, 18)  # largura básica
+        if "envolvido_cpf"  in col_idx_req: ws_req.set_column(col_idx_req["envolvido_cpf"], col_idx_req["envolvido_cpf"], 18, fmt_text)
+        if "envolvido_cnpj" in col_idx_req: ws_req.set_column(col_idx_req["envolvido_cnpj"], col_idx_req["envolvido_cnpj"], 18, fmt_text)
+        ws_req.autofilter(0, 0, max(len(req_final), 1), len(req_final.columns)-1)
         ws_req.freeze_panes(1, 0)
 
-        # Advogados: 0=nome, 1=cpf
+        # Advogados
         ws_adv = writer.sheets["Advogados"]
-        ws_adv.set_column(0, 0, 36)
-        ws_adv.set_column(1, 1, 18, fmt_text)  # CPF texto
-        ws_adv.autofilter(0, 0, max(len(df_advogados), 1), 1)
+        col_idx_adv = {c:i for i,c in enumerate(adv_final.columns)}
+        ws_adv.set_column(0, len(adv_final.columns)-1, 18)
+        if "advogado_cpf"  in col_idx_adv: ws_adv.set_column(col_idx_adv["advogado_cpf"], col_idx_adv["advogado_cpf"], 18, fmt_text)
+        if "advogado_cnpj" in col_idx_adv: ws_adv.set_column(col_idx_adv["advogado_cnpj"], col_idx_adv["advogado_cnpj"], 18, fmt_text)
+        ws_adv.autofilter(0, 0, max(len(adv_final), 1), len(adv_final.columns)-1)
         ws_adv.freeze_panes(1, 0)
 
     return FileResponse(
