@@ -447,7 +447,7 @@ async def download_requerentes_advogados_xlsx(tribunal_sigla: str):
             }
 
             for envolvido in (fonte.envolvidos or []):
-                if envolvido.tipo_normalizado != "Requerente":
+                if envolvido.tipo_normalizado not in ["Requerente", "Autor"]:
                     continue
 
                 # se não houver advogados, ainda assim registramos o requerente
