@@ -277,18 +277,6 @@ async def upload_dados_precatorios(background_tasks: BackgroundTasks, file: Uplo
 
 
 
-
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse
-from sqlalchemy.future import select
-from sqlalchemy.orm import joinedload
-from io import BytesIO
-import zipfile
-import pandas as pd
-from datetime import datetime
-
-app = FastAPI()
-
 def _digits(x, length=11) -> str:
     """Normaliza CPF/CNPJ como string, removendo caracteres não numéricos e completando zeros à esquerda."""
     if pd.isna(x): 
@@ -342,6 +330,12 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
                     valor_causa = fonte.capa.valor_causa.valor
                     break
 
+            # Formata como R$ xx.xxx,xx
+            if valor_causa is not None:
+                valor_causa_formatado = f"R$ {valor_causa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            else:
+                valor_causa_formatado = ""
+
             # Linha de credores
             row_credor = {
                 "CNPJ / CPF do Credor": credor.cnpj if credor and credor.cnpj else credor.cpf if credor else None,
@@ -354,7 +348,7 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
                 "Número dos Autos do Precatório": p.numero_cnj,
                 "Tipo do Precatório": tipo_precatorio,
                 "Tipo do Regime": tipo_regime,
-                "Valor da Causa": valor_causa,
+                "Valor da Causa": valor_causa_formatado,
             }
             df_credores_list.append(row_credor)
 
@@ -380,7 +374,7 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
                                         "Número dos Autos do Precatório": p.numero_cnj,
                                         "Tipo do Precatório": tipo_precatorio,
                                         "Tipo do Regime": tipo_regime,
-                                        "Valor da Causa": valor_causa,
+                                        "Valor da Causa": valor_causa_formatado,
                                     }
                                     df_advogados_list.append(row_advogado)
 
