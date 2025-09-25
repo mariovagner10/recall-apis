@@ -6,8 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from app.worker import processar_lote
 from app.database import AsyncSessionLocal
-from sqlalchemy.future import select
+from sqlalchemy import select, delete
 from sqlalchemy.orm import joinedload
+from sqlalchemy.dialects.postgresql import insert
 from app.models import Processo, Fonte, Capa, Envolvido, InformacaoComplementar, Advogado, OAB, DadosPrecatorio
 import openpyxl 
 from datetime import datetime
@@ -16,7 +17,7 @@ import io
 import logging
 import re
 import zipfile
-from io import BytesIO
+from io import BytesIO, StringIO
 
 app = FastAPI(title="API de Processamento de Precatórios - RECALL")
 
@@ -110,10 +111,15 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
 
     # Consulta CNJs existentes no banco
     async with AsyncSessionLocal() as session:
+        existing_cnjs = set()
+    # APLICAR O CHUNKING AQUI
+    for cnj_chunk in chunks(numeros_cnj_csv, 1000): # O tamanho do chunk pode ser ajustado
         existing_processos = await session.execute(
-            select(Processo.numero_cnj).where(Processo.numero_cnj.in_(numeros_cnj_csv))
+            select(Processo.numero_cnj).where(Processo.numero_cnj.in_(cnj_chunk))
         )
-        existing_cnjs = {p[0] for p in existing_processos}
+        # Adiciona os CNJs existentes do chunk ao nosso set
+        existing_cnjs.update({p[0] for p in existing_processos})
+
     logger.info(f"CNJs já existentes no banco: {len(existing_cnjs)}")
 
     # Filtra CNJs que serão processados
@@ -177,9 +183,10 @@ def chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
+
+
 @app.post("/upload-dados-complementares-precatorios", tags=["Popular DB"])
 async def upload_dados_precatorios(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    # Valida extensão
     if not (file.filename.endswith(".csv") or file.filename.endswith(".xlsx")):
         raise HTTPException(status_code=400, detail="Arquivo deve ser CSV ou XLSX")
 
@@ -190,92 +197,89 @@ async def upload_dados_precatorios(background_tasks: BackgroundTasks, file: Uplo
     background_tasks.add_task(delete_file, file_path)
     logger.info(f"Arquivo salvo temporariamente em: {file_path}")
 
-    # Lê arquivo
-    df = None
+    # Lê o arquivo e normaliza os dados
     if file.filename.endswith(".csv"):
         with open(file_path, "rb") as f:
             rawdata = f.read()
             result = chardet.detect(rawdata)
         encoding = result["encoding"] or "utf-8"
-        try:
-            df = pd.read_csv(file_path, dtype=str, encoding=encoding, sep=None, engine='python')
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao ler CSV: {e}")
-    else:  # XLSX
-        try:
-            df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Erro ao ler XLSX: {e}")
+        df = pd.read_csv(file_path, dtype=str, encoding=encoding, sep=None, engine='python')
+    else:
+        df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
 
-    # Padroniza colunas
     df.columns = df.columns.str.strip().str.lower()
     if "numero" not in df.columns:
         raise HTTPException(status_code=400, detail="O arquivo deve conter a coluna 'numero'")
-
-    # Normaliza CNJ e remove duplicatas
+    
     df['numero'] = df['numero'].str.strip().apply(formatar_cnj)
     df = df.drop_duplicates(subset=['numero'], keep='first')
-
-    # Consulta CNJs existentes no banco em lotes
-    processos_map = {}
+    
     cnj_list = df['numero'].tolist()
-    chunk_size = 1000
+    total_processados = 0
 
     async with AsyncSessionLocal() as session:
-        for cnj_chunk in chunks(cnj_list, chunk_size):
+        # Mapeia CNJ -> processo_id existentes
+        processos_map = {}
+        for cnj_chunk in chunks(cnj_list, 1000):
             existing_processos = await session.execute(
                 select(Processo.numero_cnj, Processo.id).where(Processo.numero_cnj.in_(cnj_chunk))
             )
             processos_map.update({p.numero_cnj: p.id for p in existing_processos.all()})
 
-        dados_precatorios_to_insert = []
+        # Prepara a lista de dados para inserção
+        dados_precatorios_a_inserir = []
+        processo_ids_a_excluir = []
+
         for _, row in df.iterrows():
             numero_cnj = row['numero']
             processo_id = processos_map.get(numero_cnj)
+
             if not processo_id:
                 logger.warning(f"Processo com CNJ {numero_cnj} não encontrado. Ignorando linha.")
                 continue
-            
-            # --- Início da correção para o Valor Deferido ---
-            valor_deferido_str = row.get("valor_deferido")
+
+            # Parsear e tratar os dados
             valor_deferido = None
+            valor_deferido_str = row.get("valor_deferido")
             if valor_deferido_str:
                 try:
-                    # Remove o R$, os pontos e substitui a vírgula por ponto
-                    cleaned_value = valor_deferido_str.replace("R$", "").replace(".", "").replace(",", ".").strip()
-                    valor_deferido = float(cleaned_value)
+                    valor_deferido = float(valor_deferido_str.replace("R$", "").replace(".", "").replace(",", ".").strip())
                 except (ValueError, TypeError):
-                    logger.warning(f"Valor deferido inválido para CNJ {numero_cnj}: '{valor_deferido_str}'. Ignorando valor.")
-            # --- Fim da correção para o Valor Deferido ---
+                    logger.warning(f"Valor deferido inválido para CNJ {numero_cnj}: '{valor_deferido_str}'.")
 
-            # Trata data base apenas como MM/YYYY
             data_base = None
             if row.get("data_base_calculo"):
                 try:
                     data_base = datetime.strptime(row["data_base_calculo"], "%m/%Y").date().replace(day=1)
                 except Exception:
                     logger.warning(f"Data base inválida para CNJ {numero_cnj}: {row['data_base_calculo']}")
+            
+            # Adicionar o ID à lista de IDs a serem excluídos e o objeto à lista de inserção
+            processo_ids_a_excluir.append(processo_id)
+            dados_precatorios_a_inserir.append(DadosPrecatorio(
+                processo_id=processo_id,
+                tipo_regime=row.get("tipo_regime"),
+                ano_orcamentario=int(row["ano_orcamentario"]) if row.get("ano_orcamentario") else None,
+                natureza_precatorio=row.get("natureza_precatorio"),
+                valor_deferido=valor_deferido,
+                data_base_calculo=data_base,
+                data_expedicao=pd.to_datetime(row.get("data_expedicao"), errors="coerce").date() if row.get("data_expedicao") else None,
+            ))
+            total_processados += 1
 
-            dados_precatorios_to_insert.append(
-                DadosPrecatorio(
-                    processo_id=processo_id,
-                    tipo_regime=row.get("tipo_regime"),
-                    ano_orcamentario=int(row["ano_orcamentario"]) if row.get("ano_orcamentario") else None,
-                    natureza_precatorio=row.get("natureza_precatorio"),
-                    valor_deferido=valor_deferido,
-                    data_base_calculo=data_base,
-                    data_expedicao=pd.to_datetime(row["data_expedicao"], errors="coerce").date() if row.get("data_expedicao") else None,
-                )
+        # Excluir registros existentes em massa
+        if processo_ids_a_excluir:
+            await session.execute(
+                delete(DadosPrecatorio).where(DadosPrecatorio.processo_id.in_(processo_ids_a_excluir))
             )
+        
+        # Inserir novos registros em massa
+        if dados_precatorios_a_inserir:
+            session.add_all(dados_precatorios_a_inserir)
+        
+        await session.commit()
 
-        if dados_precatorios_to_insert:
-            session.add_all(dados_precatorios_to_insert)
-            await session.commit()
-            logger.info(f"{len(dados_precatorios_to_insert)} registros de DadosPrecatorio inseridos com sucesso.")
-
-    return {"detail": f"Upload finalizado. {len(dados_precatorios_to_insert)} registros inseridos."}
-
-
+    return {"detail": f"Upload finalizado. {total_processados} registros inseridos."}
 
 def _digits(x, length=11) -> str:
     """Normaliza CPF/CNPJ como string, removendo caracteres não numéricos e completando zeros à esquerda."""
@@ -285,7 +289,7 @@ def _digits(x, length=11) -> str:
     s = re.sub(r"\D+", "", s)  # Remove tudo que não é dígito
     return s.zfill(length) 
 
-@app.post("/download-lista-precatorios-4-buy-callix/{tribunal_sigla}", tags=["Relatórios"])
+@app.post("/download-lista-precatorios-4-buy-lemitt/{tribunal_sigla}", tags=["Relatórios"])
 async def download_precatorios_zip(tribunal_sigla: str, background_tasks: BackgroundTasks):
     df_credores_list = []
     df_advogados_list = []
@@ -323,6 +327,7 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
             elif reu and reu.nome and ("município" in reu.nome.lower() or "municipio de" in reu.nome.lower()):
                 tipo_precatorio = "Municipal"
 
+            
             # Valor da causa
             valor_causa = None
             for fonte in p.fontes:
@@ -330,11 +335,16 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
                     valor_causa = fonte.capa.valor_causa.valor
                     break
 
+            # Se não encontrar, usar valor_deferido de DadosPrecatorio
+            if not valor_causa and dados_precatorios and dados_precatorios.valor_deferido:
+                valor_causa = dados_precatorios.valor_deferido
+
             # Formata como R$ xx.xxx,xx
             if valor_causa is not None:
                 valor_causa_formatado = f"R$ {valor_causa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             else:
                 valor_causa_formatado = ""
+
 
             # Linha de credores
             row_credor = {
@@ -344,7 +354,7 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
                 "Nome do Réu": reu.nome if reu else None,
                 "CNPJ do Réu": reu.cnpj if reu else None,
                 "UF do Precatório": p.estado_origem,
-                "Município do Precatório": p.unidade_origem_cidade if tipo_precatorio == "Municipal" else None,
+                "Município do Precatório": reu.nome if tipo_precatorio == "Municipal" else None,
                 "Número dos Autos do Precatório": p.numero_cnj,
                 "Tipo do Precatório": tipo_precatorio,
                 "Tipo do Regime": tipo_regime,
@@ -370,7 +380,7 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
                                         "Nome do Réu": reu.nome if reu else None,
                                         "CNPJ do Réu": reu.cnpj if reu else None,
                                         "UF do Precatório": p.estado_origem,
-                                        "Município do Precatório": p.unidade_origem_cidade if tipo_precatorio == "Municipal" else None,
+                                        "Município do Precatório": reu.nome if tipo_precatorio == "Municipal" else None,
                                         "Número dos Autos do Precatório": p.numero_cnj,
                                         "Tipo do Precatório": tipo_precatorio,
                                         "Tipo do Regime": tipo_regime,
@@ -400,16 +410,16 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
     zip_buffer = BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         zip_file.writestr(
-            f"lista-callix-precatorios_credores_{tribunal_sigla}_{data_geracao}.csv",
-            df_credores.to_csv(index=False, sep=';', encoding='utf-8', decimal=',', quotechar='"')
-        )
+            f"lista-Lemitt-precatorios_credores_{tribunal_sigla}_{data_geracao}.csv",
+            df_credores.to_csv(index=False, sep=';', encoding='utf-8-sig', decimal=',', quotechar='"')
+        ) 
         zip_file.writestr(
-            f"lista-callix-precatorios_advogados_{tribunal_sigla}_{data_geracao}.csv",
-            df_advogados.to_csv(index=False, sep=';', encoding='utf-8', decimal=',', quotechar='"')
+            f"lista-Lemitt-precatorios_advogados_{tribunal_sigla}_{data_geracao}.csv",
+            df_advogados.to_csv(index=False, sep=';', encoding='utf-8-sig', decimal=',', quotechar='"')
         )
 
     zip_buffer.seek(0)
-    zip_filename = f"lista-callix-precatorios_{tribunal_sigla}_{data_geracao}.zip"
+    zip_filename = f"lista-Lemitt-precatorios_{tribunal_sigla}_{data_geracao}.zip"
 
     return StreamingResponse(
         zip_buffer,
@@ -418,6 +428,340 @@ async def download_precatorios_zip(tribunal_sigla: str, background_tasks: Backgr
     )
 
 
+@app.post("/download-lista-precatorios-4-buy-lemittfinal/{tribunal_sigla}", tags=["Relatórios"])
+async def download_precatorios_zip(tribunal_sigla: str, background_tasks: BackgroundTasks):
+    df_credores_list = []
+    df_advogados_list = []
+    
+    # Conjuntos para garantir unicidade
+    credores_uniques = set()
+    advogados_uniques = set()
+
+    relations_to_load = [
+        joinedload(Processo.fontes).joinedload(Fonte.envolvidos).joinedload(Envolvido.advogados).joinedload(Advogado.oabs),
+        joinedload(Processo.dados_precatorios),
+        joinedload(Processo.fontes).joinedload(Fonte.capa).joinedload(Capa.valor_causa),
+    ]
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Processo)
+            .options(*relations_to_load)
+            .where(Processo.unidade_origem_tribunal_sigla == tribunal_sigla)
+        )
+        processos = result.scalars().unique().all()
+
+        if not processos:
+            raise HTTPException(status_code=404, detail="Nenhum processo encontrado para o tribunal fornecido.")
+
+        for p in processos:
+            dados_precatorios = p.dados_precatorios
+            tipo_regime = dados_precatorios.tipo_regime if dados_precatorios else None
+
+            reu = next((e for f in p.fontes for e in f.envolvidos if e.polo == "PASSIVO"), None)
+            credor = next((e for f in p.fontes for e in f.envolvidos if e.polo == "ATIVO" and not e.tipo_normalizado == "Advogado"), None)
+            
+            # Determina tipo do precatório
+            tipo_precatorio = None
+            if p.unidade_origem_tribunal_sigla and p.unidade_origem_tribunal_sigla.startswith("TRF"):
+                tipo_precatorio = "Federal"
+            elif reu and reu.nome and "estado" in reu.nome.lower():
+                tipo_precatorio = "Estadual"
+            elif reu and reu.nome and ("município" in reu.nome.lower() or "municipio de" in reu.nome.lower()):
+                tipo_precatorio = "Municipal"
+            
+            # Valor da causa
+            valor_causa = None
+            for fonte in p.fontes:
+                if fonte.capa and fonte.capa.valor_causa:
+                    valor_causa = fonte.capa.valor_causa.valor
+                    break
+            
+            # Se não encontrar, usar valor_deferido de DadosPrecatorio
+            if not valor_causa and dados_precatorios and dados_precatorios.valor_deferido:
+                valor_causa = dados_precatorios.valor_deferido
+            
+            # Formata como R$ xx.xxx,xx
+            if valor_causa is not None:
+                valor_causa_formatado = f"R$ {valor_causa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            else:
+                valor_causa_formatado = ""
+
+            # Coleta dados do credor, evitando duplicações
+            if credor:
+                credor_id = credor.cnpj if credor.cnpj else credor.cpf
+                if credor_id and credor_id not in credores_uniques:
+                    row_credor = {
+                        "CNPJ / CPF do Credor": credor_id,
+                        "Nome do Credor": credor.nome,
+                        "Tipo do Credor": "Pessoa Jurídica" if credor.cnpj else "Pessoa Física",
+                        "Nome do Réu": reu.nome if reu else None,
+                        "CNPJ do Réu": reu.cnpj if reu else None,
+                        "UF do Precatório": p.estado_origem,
+                        "Município do Precatório": reu.nome if tipo_precatorio == "Municipal" else None,
+                        "Número dos Autos do Precatório": p.numero_cnj,
+                        "Tipo do Precatório": tipo_precatorio,
+                        "Tipo do Regime": tipo_regime,
+                        "Valor da Causa": valor_causa_formatado,
+                    }
+                    df_credores_list.append(row_credor)
+                    credores_uniques.add(credor_id)
+
+            # Coleta dados dos advogados (apenas de credores do polo ativo e que são pessoa física), evitando duplicações
+            for fonte in p.fontes:
+                for envolvido in fonte.envolvidos:
+                    # Verifica se o envolvido é um credor (polo ATIVO) e se é uma Pessoa Física (não tem CNPJ)
+                    if envolvido.polo == "ATIVO" and not envolvido.cnpj and envolvido.cpf and envolvido.advogados:
+                        for advogado in envolvido.advogados:
+                            advogado_id = advogado.cpf
+                            if advogado_id and advogado_id not in advogados_uniques:
+                                if advogado.oabs:
+                                    for oab in advogado.oabs:
+                                        row_advogado = {
+                                            "Nome do Advogado": advogado.nome,
+                                            "CPF do Advogado": advogado.cpf,
+                                            "OAB": oab.numero,
+                                            "Estado da OAB": oab.uf,
+                                            "CNPJ / CPF do Credor": envolvido.cpf, # Usa o CPF do credor
+                                            "Nome do Credor": envolvido.nome,
+                                            "Tipo do Credor": "Pessoa Física",
+                                            "Nome do Réu": reu.nome if reu else None,
+                                            "CNPJ do Réu": reu.cnpj if reu else None,
+                                            "UF do Precatório": p.estado_origem,
+                                            "Município do Precatório": reu.nome if tipo_precatorio == "Municipal" else None,
+                                            "Número dos Autos do Precatório": p.numero_cnj,
+                                            "Tipo do Precatório": tipo_precatorio,
+                                            "Tipo do Regime": tipo_regime,
+                                            "Valor da Causa": valor_causa_formatado,
+                                        }
+                                        df_advogados_list.append(row_advogado)
+                                        advogados_uniques.add(advogado_id)
+                                        break  # Adiciona apenas uma OAB por advogado e sai do loop
+                                else:
+                                    # Caso o advogado não tenha OAB, ainda o adiciona
+                                    row_advogado = {
+                                        "Nome do Advogado": advogado.nome,
+                                        "CPF do Advogado": advogado.cpf,
+                                        "OAB": None,
+                                        "Estado da OAB": None,
+                                        "CNPJ / CPF do Credor": envolvido.cpf,
+                                        "Nome do Credor": envolvido.nome,
+                                        "Tipo do Credor": "Pessoa Física",
+                                        "Nome do Réu": reu.nome if reu else None,
+                                        "CNPJ do Réu": reu.cnpj if reu else None,
+                                        "UF do Precatório": p.estado_origem,
+                                        "Município do Precatório": reu.nome if tipo_precatorio == "Municipal" else None,
+                                        "Número dos Autos do Precatório": p.numero_cnj,
+                                        "Tipo do Precatório": tipo_precatorio,
+                                        "Tipo do Regime": tipo_regime,
+                                        "Valor da Causa": valor_causa_formatado,
+                                    }
+                                    df_advogados_list.append(row_advogado)
+                                    advogados_uniques.add(advogado_id)
+
+    if not df_credores_list and not df_advogados_list:
+        raise HTTPException(status_code=404, detail="Nenhum dado encontrado para o tribunal fornecido.")
+
+    # Criar DataFrames
+    df_credores = pd.DataFrame(df_credores_list)
+    df_advogados = pd.DataFrame(df_advogados_list)
+
+    # Garantir CPF/CNPJ como string, preenchendo zeros à esquerda
+    if "CNPJ / CPF do Credor" in df_credores.columns:
+        df_credores["CNPJ / CPF do Credor"] = df_credores["CNPJ / CPF do Credor"].apply(lambda x: _digits(x, 11) if len(str(x)) <= 11 else _digits(x, 14))
+    if "CNPJ do Réu" in df_credores.columns:
+        df_credores["CNPJ do Réu"] = df_credores["CNPJ do Réu"].apply(lambda x: _digits(x, 11) if len(str(x)) <= 11 else _digits(x, 14))
+    if "CPF do Advogado" in df_advogados.columns:
+        df_advogados["CPF do Advogado"] = df_advogados["CPF do Advogado"].apply(lambda x: _digits(x, 11))
+
+    # Data de geração
+    data_geracao = datetime.now().strftime("%Y%m%d%H%M%S")
+
+    # Criar zip em memória
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            f"lista-Lemitt-precatorios_credores_{tribunal_sigla}_{data_geracao}.csv",
+            df_credores.to_csv(index=False, sep=';', encoding='utf-8-sig', decimal=',', quotechar='"')
+        )
+        zip_file.writestr(
+            f"lista-Lemitt-precatorios_advogados_{tribunal_sigla}_{data_geracao}.csv",
+            df_advogados.to_csv(index=False, sep=';', encoding='utf-8-sig', decimal=',', quotechar='"')
+        )
+
+    zip_buffer.seek(0)
+    zip_filename = f"lista-Lemitt-precatorios_{tribunal_sigla}_{data_geracao}.zip"
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_filename}"}
+    )
+
+
+@app.post("/download-lista-para-Lemetti-agrupada-precatorios/{tribunal_sigla}", tags=["Relatórios"])
+async def download_precatorios_agrupados(tribunal_sigla: str, background_tasks: BackgroundTasks):
+    # Dicionários para agrupar dados por credor e advogado
+    agrupamento_credores = {}
+    agrupamento_advogados = {}
+
+    relations_to_load = [
+        joinedload(Processo.fontes).joinedload(Fonte.envolvidos).joinedload(Envolvido.advogados).joinedload(Advogado.oabs),
+        joinedload(Processo.dados_precatorios),
+        joinedload(Processo.fontes).joinedload(Fonte.capa).joinedload(Capa.valor_causa),
+    ]
+
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Processo)
+            .options(*relations_to_load)
+            .where(Processo.unidade_origem_tribunal_sigla == tribunal_sigla)
+        )
+        processos = result.scalars().unique().all()
+
+    if not processos:
+        raise HTTPException(status_code=404, detail="Nenhum processo encontrado para o tribunal fornecido.")
+
+    for p in processos:
+        dados_precatorios = p.dados_precatorios
+        tipo_regime = dados_precatorios.tipo_regime if dados_precatorios else None
+
+        reu = next((e for f in p.fontes for e in f.envolvidos if e.polo == "PASSIVO"), None)
+        credor = next((e for f in p.fontes for e in f.envolvidos if e.polo == "ATIVO" and not e.tipo_normalizado == "Advogado"), None)
+
+        # Determina tipo do precatório
+        tipo_precatorio = None
+        if p.unidade_origem_tribunal_sigla and p.unidade_origem_tribunal_sigla.startswith("TRF"):
+            tipo_precatorio = "Federal"
+        elif reu and reu.nome and "estado" in reu.nome.lower():
+            tipo_precatorio = "Estadual"
+        elif reu and reu.nome and ("município" in reu.nome.lower() or "municipio de" in reu.nome.lower()):
+            tipo_precatorio = "Municipal"
+
+        # Valor da causa
+        valor_causa = None
+        for fonte in p.fontes:
+            if fonte.capa and fonte.capa.valor_causa:
+                valor_causa = fonte.capa.valor_causa.valor
+                break
+        
+        # Se não encontrar, usar valor_deferido de DadosPrecatorio
+        if not valor_causa and dados_precatorios and dados_precatorios.valor_deferido:
+            valor_causa = dados_precatorios.valor_deferido
+
+        # Formata como R$ xx.xxx,xx
+        valor_causa_formatado = f"R$ {valor_causa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if valor_causa is not None else ""
+
+        # Dados do processo para serem reutilizados
+        processo_data = {
+            "Numero_Autos": p.numero_cnj,
+            "UF_Precatorio": p.estado_origem,
+            "Municipio_Precatorio": reu.nome if tipo_precatorio == "Municipal" else None,
+            "Tipo_Precatorio": tipo_precatorio,
+            "Tipo_Regime": tipo_regime,
+            "Valor_Causa": valor_causa_formatado,
+        }
+
+        # Agrupa por Credor
+        if credor:
+            credor_id = credor.cpf if credor.cpf else credor.cnpj if credor.cnpj else credor.nome
+            if credor_id not in agrupamento_credores:
+                agrupamento_credores[credor_id] = {
+                    "Nome": credor.nome,
+                    "CPF_CNPJ": credor.cpf if credor.cpf else credor.cnpj if credor.cnpj else None,
+                    "Tipo": "Pessoa Jurídica" if credor.cnpj else "Pessoa Física" if credor.cpf else None,
+                    "Nome_Reu": reu.nome if reu else None,
+                    "CNPJ_Reu": reu.cnpj if reu else None,
+                    "processos": [],
+                }
+            agrupamento_credores[credor_id]["processos"].append(processo_data)
+
+        # Agrupa por Advogado
+        for fonte in p.fontes:
+            for envolvido in fonte.envolvidos:
+                if envolvido.polo == "ATIVO" and envolvido.advogados:
+                    for advogado in envolvido.advogados:
+                        advogado_key = advogado.cpf or advogado.nome
+                        if advogado_key not in agrupamento_advogados:
+                            agrupamento_advogados[advogado_key] = {
+                                "Nome": advogado.nome,
+                                "CPF": advogado.cpf,
+                                "OABs": set(),
+                                "processos": [],
+                            }
+                        agrupamento_advogados[advogado_key]["processos"].append(processo_data)
+                        if advogado.oabs:
+                            for oab in advogado.oabs:
+                                agrupamento_advogados[advogado_key]["OABs"].add(f"{oab.numero}/{oab.uf}")
+
+
+    # Geração dos CSVs
+    def generate_credor_csv(agrupamento):
+        csv_buffer = StringIO()
+        csv_buffer.write("Nome do Credor;CNPJ / CPF do Credor;Tipo do Credor;Nome do Réu;CNPJ do Réu;Número de Processos\n")
+        
+        for credor_data in agrupamento.values():
+            credor_cnpj_cpf = credor_data["CPF_CNPJ"]
+            if credor_data["CPF_CNPJ"] and len(credor_data["CPF_CNPJ"]) <= 11:
+                credor_cnpj_cpf = _digits(credor_data["CPF_CNPJ"], 11)
+            elif credor_data["CPF_CNPJ"]:
+                credor_cnpj_cpf = _digits(credor_data["CPF_CNPJ"], 14)
+            
+            csv_buffer.write(f'"{credor_data["Nome"]}";"{credor_cnpj_cpf}";"{credor_data["Tipo"]}";"{credor_data["Nome_Reu"]}";"{_digits(credor_data["CNPJ_Reu"], 14)}";{len(credor_data["processos"])}\n')
+            
+            # Sub-tabela de processos
+            csv_buffer.write("Número dos Autos do Precatório;UF do Precatório;Município do Precatório;Tipo do Precatório;Tipo do Regime;Valor da Causa\n")
+            for p in credor_data["processos"]:
+                csv_buffer.write(f'"{p["Numero_Autos"]}";"{p["UF_Precatorio"]}";"{p["Municipio_Precatorio"] or ""}";"{p["Tipo_Precatorio"] or ""}";"{p["Tipo_Regime"] or ""}";"{p["Valor_Causa"]}"\n')
+            csv_buffer.write("\n")
+        
+        return csv_buffer.getvalue()
+
+    def generate_advogado_csv(agrupamento):
+        csv_buffer = StringIO()
+        csv_buffer.write("Nome do Advogado;CPF do Advogado;OABs;Número de Processos\n")
+        
+        for advogado_data in agrupamento.values():
+            cpf_adv = _digits(advogado_data["CPF"], 11) if advogado_data["CPF"] else ""
+            oabs_str = ", ".join(advogado_data["OABs"])
+            
+            csv_buffer.write(f'"{advogado_data["Nome"]}";"{cpf_adv}";"{oabs_str}";{len(advogado_data["processos"])}\n')
+            
+            # Sub-tabela de processos
+            csv_buffer.write("Número dos Autos do Precatório;UF do Precatório;Município do Precatório;Tipo do Precatório;Tipo do Regime;Valor da Causa\n")
+            for p in advogado_data["processos"]:
+                csv_buffer.write(f'"{p["Numero_Autos"]}";"{p["UF_Precatorio"]}";"{p["Municipio_Precatorio"] or ""}";"{p["Tipo_Precatorio"] or ""}";"{p["Tipo_Regime"] or ""}";"{p["Valor_Causa"]}"\n')
+            csv_buffer.write("\n")
+            
+        return csv_buffer.getvalue()
+
+    csv_credores_str = generate_credor_csv(agrupamento_credores)
+    csv_advogados_str = generate_advogado_csv(agrupamento_advogados)
+
+    if not csv_credores_str and not csv_advogados_str:
+        raise HTTPException(status_code=404, detail="Nenhum dado encontrado para o tribunal fornecido.")
+
+    # Criar zip em memória
+    zip_buffer = BytesIO()
+    data_geracao = datetime.now().strftime("%Y%m%d%H%M%S")
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            f"lista-para-Lemetti-agrupada-precatorios_credores_{tribunal_sigla}_{data_geracao}.csv",
+            csv_credores_str.encode("utf-8-sig")
+        ) 
+        zip_file.writestr(
+            f"lista-para-Lemetti-agrupada-precatorios_advogados_{tribunal_sigla}_{data_geracao}.csv",
+            csv_advogados_str.encode("utf-8-sig")
+        )
+
+    zip_buffer.seek(0)
+    zip_filename = f"lista-agrupada-precatorios_{tribunal_sigla}_{data_geracao}.zip"
+
+    return StreamingResponse(
+        zip_buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename={zip_filename}"}
+    )
 
 
 # --- Download CSV geral ---
