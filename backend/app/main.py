@@ -101,25 +101,31 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     if "numero" not in df.columns:
         logger.error("Coluna 'numero' não encontrada no arquivo")
         raise HTTPException(status_code=400, detail="O arquivo deve conter a coluna 'numero'")
+    
+    total_linhas_originais = len(df)
 
     # Remove espaços, aplica formatação e remove duplicatas
     df['numero'] = df['numero'].str.strip().apply(formatar_cnj)
-    df = df.drop_duplicates(subset=['numero'], keep='first')
-    logger.info(f"Duplicatas internas removidas. Total de linhas únicas: {len(df)}")
+    df_deduplicado = df.drop_duplicates(subset=['numero'], keep='first')
+    
+    total_deduplicado_interno = total_linhas_originais - len(df_deduplicado)
+    df = df_deduplicado # Atribui o DataFrame limpo de volta
 
     numeros_cnj_csv = df["numero"].dropna().tolist()
     logger.info(f"Total de CNJs após remover duplicatas internas: {len(numeros_cnj_csv)}")
-
+    logger.info(f"Duplicatas internas removidas. Total de linhas únicas: {len(df)}")
+    # Consulta CNJs existentes no banco
+    existing_cnjs = set()
+    # Usa o 'async with' aqui para garantir que a sessão é fechada (como já está)
     # Consulta CNJs existentes no banco
     async with AsyncSessionLocal() as session:
-        existing_cnjs = set()
-    # APLICAR O CHUNKING AQUI
-    for cnj_chunk in chunks(numeros_cnj_csv, 1000): # O tamanho do chunk pode ser ajustado
-        existing_processos = await session.execute(
-            select(Processo.numero_cnj).where(Processo.numero_cnj.in_(cnj_chunk))
-        )
-        # Adiciona os CNJs existentes do chunk ao nosso set
-        existing_cnjs.update({p[0] for p in existing_processos})
+        # APLICAR O CHUNKING AQUI
+        for cnj_chunk in chunks(numeros_cnj_csv, 1000): # O tamanho do chunk pode ser ajustado
+            existing_processos = await session.execute(
+                select(Processo.numero_cnj).where(Processo.numero_cnj.in_(cnj_chunk))
+            )
+            # Adiciona os CNJs existentes do chunk ao nosso set
+            existing_cnjs.update({p[0] for p in existing_processos})
 
     logger.info(f"CNJs já existentes no banco: {len(existing_cnjs)}")
 
@@ -127,10 +133,18 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     numeros_cnj_para_processar = [cnj for cnj in numeros_cnj_csv if cnj not in existing_cnjs]
     total_novos = len(numeros_cnj_para_processar)
     total_existentes = len(existing_cnjs)
+    
+    # --- NOVO: Soma o total geral de deduplicação ---
+    total_deduplicado_geral = total_deduplicado_interno + total_existentes
+
     logger.info(f"CNJs a processar: {total_novos}")
 
     if not numeros_cnj_para_processar:
-        aviso = f"Nenhum novo precatório para processar. {total_existentes} já existem no banco de dados."
+        aviso = (
+            f"Nenhum novo precatório para processar. "
+            f"{total_existentes} já existem no banco de dados. "
+            f"Total de processos ignorados (duplicados no arquivo ou no DB): {total_deduplicado_geral}."
+        )
         logger.info(aviso)
         return {"detail": aviso}
 
@@ -144,7 +158,9 @@ async def upload_file(background_tasks: BackgroundTasks, file: UploadFile = File
     aviso_final = (
         f"Arquivo processado com sucesso! "
         f"{total_novos} novos precatórios processados. "
-        f"{total_existentes} precatórios já existentes foram ignorados."
+        f"{total_existentes} já existiam no DB e foram ignorados. "
+        f"{total_deduplicado_interno} duplicatas internas do arquivo foram removidas. "
+        f"Total de processos ignorados: {total_deduplicado_geral}."
     )
     logger.info(aviso_final)
     
